@@ -329,6 +329,18 @@
             <span id="micStatusBadge" class="text-[11px] font-semibold px-2 py-0.5 rounded-full bg-slate-800 text-slate-300">Mic Off</span>
           </div>
 
+          <!-- Choose between Bluetooth Intercom and Bluetooth Headset -->
+          <div class="grid grid-cols-2 gap-2 p-1 bg-slate-950 border border-slate-800 rounded-xl">
+            <button id="modeIntercomBtn" type="button" class="py-2 px-2.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white shadow-sm inline-flex items-center justify-center gap-1.5 transition">
+              <i data-lucide="radio" class="w-3.5 h-3.5"></i>
+              <span>Bluetooth Intercom</span>
+            </button>
+            <button id="modeHeadsetBtn" type="button" class="py-2 px-2.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white inline-flex items-center justify-center gap-1.5 transition">
+              <i data-lucide="headphones" class="w-3.5 h-3.5"></i>
+              <span>Bluetooth Headset</span>
+            </button>
+          </div>
+
           <div class="bg-slate-950/70 border border-slate-800 rounded-xl p-3.5 space-y-3">
             <div class="flex items-center justify-between gap-2">
               <div class="flex items-center gap-2">
@@ -582,6 +594,8 @@
         riders: [
           {
             id: 'you-' + Math.random().toString(36).slice(2, 7),
+            peerId: '',
+            audioDeviceMode: 'Bluetooth Intercom',
             name: 'You',
             mobileNumber: '',
             emergencyContact: '',
@@ -828,7 +842,8 @@
           const peer = new Peer(myPeerId);
           state.peer = peer;
 
-          peer.on('open', () => {
+          peer.on('open', (myId) => {
+            state.riders[0].peerId = myId;
             p2pStatusBadge.textContent = state.isLeader ? 'Room Host Active' : 'Connected to Room';
             p2pStatusBadge.className = 'text-[11px] font-medium px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30';
             if (!state.isLeader) {
@@ -909,6 +924,34 @@
         });
       }
 
+      function applyAudioOutputToEl(audioEl) {
+        const sinkId = audioOutputSelect?.value;
+        if (sinkId && sinkId !== 'default' && typeof audioEl.setSinkId === 'function') {
+          audioEl.setSinkId(sinkId).catch(() => {});
+        }
+      }
+
+      function syncRiderAudioElement(rider) {
+        if (!rider || !rider.peerId) return;
+        const audioEl = document.getElementById(`audio_${rider.peerId}`);
+        if (audioEl) {
+          audioEl.muted = !!rider.muted;
+          audioEl.volume = Math.max(0, Math.min(1, (rider.volume ?? 100) / 100));
+        }
+      }
+
+      function connectAudioToAllPeers() {
+        if (!state.peer || !state.micStream) return;
+        state.riders.slice(1).forEach((r) => {
+          if (r.peerId && !state.mediaConns[r.peerId]) {
+            try {
+              const call = state.peer.call(r.peerId, state.micStream);
+              setupMediaCall(call);
+            } catch (e) {}
+          }
+        });
+      }
+
       function setupMediaCall(call) {
         state.mediaConns[call.peer] = call;
         call.on('stream', (remoteStream) => {
@@ -917,9 +960,13 @@
             audioEl = document.createElement('audio');
             audioEl.id = `audio_${call.peer}`;
             audioEl.autoplay = true;
+            audioEl.playsInline = true;
             document.getElementById('remoteAudioContainer').appendChild(audioEl);
           }
           audioEl.srcObject = remoteStream;
+          applyAudioOutputToEl(audioEl);
+          const matchedRider = state.riders.find((r) => r.peerId === call.peer);
+          if (matchedRider) syncRiderAudioElement(matchedRider);
         });
       }
 
@@ -948,6 +995,7 @@
         }
         renderRiders();
         renderIntercomChannels();
+        connectAudioToAllPeers();
       }
 
       function broadcastMessage(type) {
@@ -1181,7 +1229,7 @@
               <div class="min-w-0">
                 <p class="text-xs font-semibold text-white truncate">${r.name}</p>
                 <p class="text-[10px] ${r.rideEnded ? 'text-rose-400' : (r.muted ? 'text-rose-400' : 'text-emerald-400')}">
-                  ${r.rideEnded ? 'Ended Ride' : (r.muted ? 'Muted' : 'Connected • BT/Net')}
+                  ${r.rideEnded ? 'Ended Ride' : (r.muted ? 'Muted' : (r.audioDeviceMode || 'Bluetooth Intercom') + ' • Live')}
                 </p>
               </div>
             </div>
@@ -1200,6 +1248,7 @@
             const r = state.riders.find((x) => x.id === btn.dataset.id);
             if (r) {
               r.muted = !r.muted;
+              syncRiderAudioElement(r);
               renderIntercomChannels();
             }
           });
@@ -1208,7 +1257,7 @@
         intercomChannelsEl.querySelectorAll('.rider-vol-slider').forEach((inp) => {
           inp.addEventListener('input', () => {
             const r = state.riders.find((x) => x.id === inp.dataset.id);
-            if (r) r.volume = Number(inp.value);
+            if (r) { r.volume = Number(inp.value); syncRiderAudioElement(r); }
           });
         });
 
@@ -1352,15 +1401,36 @@
         } catch (e) {}
       }
 
+      function updateMicTrackEnabled() {
+        if (!state.micStream) return;
+        const enabled = !state.pttMode || state.pttPressed;
+        state.micStream.getAudioTracks().forEach((t) => { t.enabled = enabled; });
+      }
+
       async function startMic() {
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           showToast('Microphone API unavailable in this view');
           return;
         }
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+          const selectedInput = audioInputSelect?.value;
+          const audioConstraints = {
+            echoCancellation: true,
+            noiseSuppression: true,
+            autoGainControl: true
+          };
+          if (selectedInput && selectedInput !== 'default') {
+            audioConstraints.deviceId = { exact: selectedInput };
+          }
+          const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints });
+          if (state.micStream) {
+            state.micStream.getTracks().forEach((t) => t.stop());
+          }
           state.micStream = stream;
+          updateMicTrackEnabled();
+
           const AudioContextCls = window.AudioContext || window.webkitAudioContext;
+          if (state.audioCtx) state.audioCtx.close().catch(() => {});
           state.audioCtx = new AudioContextCls();
           const src = state.audioCtx.createMediaStreamSource(stream);
           state.analyser = state.audioCtx.createAnalyser();
@@ -1368,23 +1438,32 @@
           src.connect(state.analyser);
           state.micConnected = true;
 
-          if (state.peer && !state.isLeader) {
-            try {
-              const call = state.peer.call(`ridecomm-room-${state.roomCode}`, stream);
-              setupMediaCall(call);
-            } catch (e) {}
-          }
+          // Replace track on existing calls or initiate calls to all peers
+          const newTrack = stream.getAudioTracks()[0];
+          Object.values(state.mediaConns).forEach((call) => {
+            const sender = call.peerConnection?.getSenders?.().find((s) => s.track && s.track.kind === 'audio');
+            if (sender && newTrack) sender.replaceTrack(newTrack).catch(() => {});
+          });
+          connectAudioToAllPeers();
 
           micBtnLabel.textContent = 'Mute Mic';
           micStatusBadge.textContent = state.pttMode ? 'PTT Ready' : 'Live Open Mic';
           micStatusBadge.className = 'text-[11px] font-semibold px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-300';
           populateAudioDevices();
           monitorMicLevel();
-          showToast('Microphone / BT headset connected');
+          showToast('Bluetooth / Microphone connected');
         } catch (e) {
-          showToast('Microphone permission denied');
+          showToast('Microphone permission denied or device busy');
         }
       }
+
+      audioInputSelect.addEventListener('change', () => {
+        if (state.micConnected) startMic();
+      });
+      audioOutputSelect.addEventListener('change', () => {
+        document.querySelectorAll('#remoteAudioContainer audio').forEach((el) => applyAudioOutputToEl(el));
+        showToast('Audio output routed to selected headset');
+      });
 
       function stopMic() {
         if (state.micStream) {
@@ -1421,6 +1500,26 @@
         requestAnimationFrame(loop);
       }
 
+      const modeIntercomBtn = document.getElementById('modeIntercomBtn');
+      const modeHeadsetBtn = document.getElementById('modeHeadsetBtn');
+
+      function setAudioDeviceMode(mode) {
+        state.riders[0].audioDeviceMode = mode;
+        const isIntercom = mode === 'Bluetooth Intercom';
+        modeIntercomBtn.className = isIntercom
+          ? 'py-2 px-2.5 rounded-lg text-xs font-semibold bg-indigo-600 text-white shadow-sm inline-flex items-center justify-center gap-1.5 transition'
+          : 'py-2 px-2.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white inline-flex items-center justify-center gap-1.5 transition';
+        modeHeadsetBtn.className = !isIntercom
+          ? 'py-2 px-2.5 rounded-lg text-xs font-semibold bg-sky-600 text-white shadow-sm inline-flex items-center justify-center gap-1.5 transition'
+          : 'py-2 px-2.5 rounded-lg text-xs font-semibold text-slate-400 hover:text-white inline-flex items-center justify-center gap-1.5 transition';
+        broadcastMessage('telemetry');
+        if (state.micConnected) startMic();
+        showToast(`Switched to ${mode} mode`);
+      }
+
+      modeIntercomBtn.addEventListener('click', () => setAudioDeviceMode('Bluetooth Intercom'));
+      modeHeadsetBtn.addEventListener('click', () => setAudioDeviceMode('Bluetooth Headset'));
+
       toggleMicBtn.addEventListener('click', () => {
         if (state.micConnected) stopMic();
         else startMic();
@@ -1429,15 +1528,16 @@
       pttModeToggle.addEventListener('change', () => {
         state.pttMode = pttModeToggle.checked;
         pttBtn.classList.toggle('hidden', !state.pttMode);
+        updateMicTrackEnabled();
         if (state.micConnected) {
           micStatusBadge.textContent = state.pttMode ? 'PTT Ready' : 'Live Open Mic';
         }
       });
 
-      pttBtn.addEventListener('mousedown', () => { state.pttPressed = true; });
-      pttBtn.addEventListener('mouseup', () => { state.pttPressed = false; });
-      pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); state.pttPressed = true; });
-      pttBtn.addEventListener('touchend', () => { state.pttPressed = false; });
+      pttBtn.addEventListener('mousedown', () => { state.pttPressed = true; updateMicTrackEnabled(); });
+      pttBtn.addEventListener('mouseup', () => { state.pttPressed = false; updateMicTrackEnabled(); });
+      pttBtn.addEventListener('touchstart', (e) => { e.preventDefault(); state.pttPressed = true; updateMicTrackEnabled(); });
+      pttBtn.addEventListener('touchend', () => { state.pttPressed = false; updateMicTrackEnabled(); });
 
       // --- Mileage Calculator ---
       const fuelAddedInput = document.getElementById('fuelAddedInput');
